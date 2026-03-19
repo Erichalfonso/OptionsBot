@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+node_modules/
+trades.db
+bot.log
+signal_history.json
+test_connection.py
+fetch_signals.py
+fetch_history.py
