@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Optional
 
 from logger_setup import setup_logger
@@ -200,49 +200,60 @@ class PositionTracker:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_weekly_pnl(self) -> float:
-        """Calculate realized P&L from last week (Mon-Fri).
+    def get_last_closed_profit(self, ticker: str) -> float:
+        """Get realized P&L from the most recently closed position for a ticker.
 
-        Used by the risk manager to set the weekly risk budget.
+        Used for lotto/rollup sizing: "I made $1000 on SPY, so my lotto
+        budget is 35% of $1000 = $350."
+
+        Finds the last BUY trade for this ticker that is CLOSED, then sums
+        all SELL trades with the same ticker/strike/option_type to get total
+        revenue, and computes profit = revenue - cost.
 
         Returns:
-            Total realized P&L from the previous trading week.
+            Realized profit in dollars, or 0.0 if no closed position found.
         """
         conn = self._get_conn()
-        today = date.today()
-        # Find last Monday
-        days_since_monday = today.weekday()
-        this_monday = today - timedelta(days=days_since_monday)
-        last_monday = this_monday - timedelta(days=7)
-        last_friday = this_monday - timedelta(days=2)  # Saturday - 2 = Friday... adjust
-        # Actually: last week = last_monday to last_friday (inclusive)
-        last_friday = this_monday - timedelta(days=1)  # Sunday before this monday
-        # Simpler: just get all trades from 7-14 days ago
-        start = last_monday.isoformat()
-        end = this_monday.isoformat()
 
-        rows = conn.execute(
+        # Find the most recent closed BUY for this ticker
+        last_buy = conn.execute(
             """
-            SELECT action, price, quantity FROM trades
-            WHERE timestamp >= ? AND timestamp < ?
-              AND status IN ('CLOSED', 'PARTIAL')
+            SELECT * FROM trades
+            WHERE action = 'BUY' AND ticker = ? AND status = 'CLOSED'
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (ticker,),
+        ).fetchone()
+
+        if not last_buy:
+            return 0.0
+
+        # Find all SELL trades matching this position
+        sells = conn.execute(
+            """
+            SELECT price, quantity FROM trades
+            WHERE action = 'SELL'
+              AND ticker = ?
+              AND strike = ?
+              AND option_type = ?
+              AND timestamp >= ?
             ORDER BY timestamp ASC
             """,
-            (start, end),
+            (last_buy["ticker"], last_buy["strike"],
+             last_buy["option_type"], last_buy["timestamp"]),
         ).fetchall()
 
-        total_revenue = 0.0
-        total_cost = 0.0
-        for row in rows:
-            value = row["price"] * row["quantity"] * 100
-            if row["action"] == "SELL":
-                total_revenue += value
-            elif row["action"] == "BUY":
-                total_cost += value
+        buy_cost = last_buy["price"] * last_buy["quantity"] * 100
+        sell_revenue = sum(row["price"] * row["quantity"] * 100 for row in sells)
+        profit = sell_revenue - buy_cost
 
-        pnl = total_revenue - total_cost
-        logger.info("Last week P&L (from %s to %s): $%.2f", start, end, pnl)
-        return pnl
+        logger.info(
+            "Last closed %s position: bought %d @ $%.2f ($%.2f), sold for $%.2f, profit=$%.2f",
+            ticker, last_buy["quantity"], last_buy["price"], buy_cost, sell_revenue, profit,
+        )
+
+        return max(0.0, profit)
 
     def calculate_pnl(self, ticker: str, strike: float, option_type: str) -> Optional[float]:
         """Calculate realized P&L for a closed position.

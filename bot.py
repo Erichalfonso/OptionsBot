@@ -46,10 +46,6 @@ def _update_risk_state() -> None:
         )
         risk.update_exposure(total_exposure)
 
-        # Calculate last week's P&L for weekly risk budget
-        weekly_pnl = tracker.get_weekly_pnl()
-        risk.set_weekly_pnl(weekly_pnl)
-
     except Exception as exc:
         logger.error("Failed to update risk state: %s", exc)
 
@@ -117,12 +113,11 @@ async def handle_buy(signal: Signal) -> None:
     # For lotto/rollup, try to find the profit from the original trade
     original_profit = 0.0
     if is_lotto or is_rollup:
-        original_profit = _estimate_recent_profit(signal.ticker)
+        original_profit = _get_last_closed_profit(signal.ticker)
 
     # Let the risk manager determine quantity
     quantity = risk.calculate_position_size(
         signal_price=signal.price,
-        expiry=signal.expiry,
         is_lotto=is_lotto,
         is_rollup=is_rollup,
         original_trade_profit=original_profit,
@@ -154,26 +149,16 @@ async def handle_buy(signal: Signal) -> None:
     _update_risk_state()
 
 
-def _estimate_recent_profit(ticker: str) -> float:
-    """Estimate recent realized profit for a ticker to size lotto/rollup trades.
+def _get_last_closed_profit(ticker: str) -> float:
+    """Get realized profit from the last fully closed position for this ticker.
 
-    Looks at the most recent closed position for this ticker.
+    Used for lotto/rollup sizing per grailedmund's rule:
+    'I made $1000 on a trade, I would take $300-400 and put it into a roll up.'
     """
     try:
-        history = tracker.get_trade_history(limit=20)
-        # Find recent SELL trades for this ticker
-        sells = [t for t in history if t["ticker"] == ticker and t["action"] == "SELL"]
-        buys = [t for t in history if t["ticker"] == ticker and t["action"] == "BUY"]
-
-        if sells and buys:
-            # Simple estimate: last sell price vs last buy price * quantity
-            last_sell = sells[0]
-            last_buy = buys[0]
-            profit = (last_sell["price"] - last_buy["price"]) * last_buy["quantity"] * 100
-            return max(0.0, profit)
+        return tracker.get_last_closed_profit(ticker)
     except Exception:
-        pass
-    return 0.0
+        return 0.0
 
 
 async def handle_sell(signal: Signal) -> None:
