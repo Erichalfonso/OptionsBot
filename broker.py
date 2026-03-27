@@ -128,9 +128,6 @@ class AlpacaBroker:
             }
             logger.info("BUY order submitted: %s", result)
 
-            # Refresh buying power after trade
-            self.refresh_buying_power()
-
             return result
 
         except Exception as exc:
@@ -185,7 +182,6 @@ class AlpacaBroker:
             }
             logger.info("SELL order submitted: %s", result)
 
-            self.refresh_buying_power()
             return result
 
         except Exception as exc:

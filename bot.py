@@ -6,6 +6,7 @@ Risk management enforced on every trade per Optionsful guidelines.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 
 import discord
@@ -13,6 +14,7 @@ import discord
 import config
 from broker import AlpacaBroker
 from logger_setup import setup_logger
+from notifier import send_signal_email
 from parser import Signal, parse_message, parse_sell_size
 from positions import PositionTracker
 from risk_manager import RiskManager
@@ -84,15 +86,19 @@ async def on_message(message: discord.Message) -> None:
 
     logger.info("Signal received:\n%s", message.content)
 
-    signals = parse_message(message.content)
+    # Fire-and-forget: email runs in background, never blocks trading
+    asyncio.create_task(_send_email_background(message.content))
+
+    # Parse + refresh risk state concurrently
+    signals, _ = await asyncio.gather(
+        asyncio.to_thread(parse_message, message.content),
+        asyncio.to_thread(_update_risk_state),
+    )
     if not signals:
         logger.info("No valid signals parsed from message")
         return
 
     logger.info("Parsed %d signal(s) — executing", len(signals))
-
-    # Refresh risk state before processing trades
-    _update_risk_state()
 
     for signal in signals:
         try:
@@ -102,6 +108,14 @@ async def on_message(message: discord.Message) -> None:
                 await handle_sell(signal)
         except Exception as exc:
             logger.error("Error processing %s %s: %s", signal.action, signal.ticker, exc, exc_info=True)
+
+
+async def _send_email_background(content: str) -> None:
+    """Send email notification in background — never blocks trading."""
+    try:
+        await asyncio.to_thread(send_signal_email, content)
+    except Exception as exc:
+        logger.error("Background email failed: %s", exc)
 
 
 async def handle_buy(signal: Signal) -> None:
@@ -136,7 +150,7 @@ async def handle_buy(signal: Signal) -> None:
     )
 
     try:
-        order_result = broker.buy_option(signal, quantity)
+        order_result = await asyncio.to_thread(broker.buy_option, signal, quantity)
         logger.info("Order placed: %s", order_result)
     except Exception as exc:
         logger.error("Broker buy failed: %s", exc)
@@ -145,8 +159,8 @@ async def handle_buy(signal: Signal) -> None:
 
     tracker.record_trade(signal, quantity, status="OPEN")
 
-    # Update exposure after trade
-    _update_risk_state()
+    # Update exposure after trade — fire-and-forget, don't block next signal
+    asyncio.create_task(asyncio.to_thread(_update_risk_state))
 
 
 def _get_last_closed_profit(ticker: str) -> float:
@@ -191,7 +205,7 @@ async def handle_sell(signal: Signal) -> None:
     )
 
     try:
-        order_result = broker.sell_option(signal, current_quantity=current_qty)
+        order_result = await asyncio.to_thread(broker.sell_option, signal, current_quantity=current_qty)
         logger.info("Sell order placed: %s", order_result)
     except Exception as exc:
         logger.error("Broker sell failed: %s", exc)
@@ -211,8 +225,8 @@ async def handle_sell(signal: Signal) -> None:
         tracker.update_position_status(position["id"], "PARTIAL")
         logger.info("Partial sell — %d contracts remaining", remaining)
 
-    # Update risk state after sell
-    _update_risk_state()
+    # Update risk state after sell — fire-and-forget
+    asyncio.create_task(asyncio.to_thread(_update_risk_state))
 
 
 def main() -> None:
