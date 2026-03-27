@@ -7,7 +7,7 @@ Risk management enforced on every trade per Optionsful guidelines.
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 
 import discord
 
@@ -86,14 +86,12 @@ async def on_message(message: discord.Message) -> None:
 
     logger.info("Signal received:\n%s", message.content)
 
-    # Fire-and-forget: email runs in background, never blocks trading
+    # Fire-and-forget: email and risk refresh run in background, never block trading
     asyncio.create_task(_send_email_background(message.content))
+    asyncio.create_task(asyncio.to_thread(_update_risk_state))
 
-    # Parse + refresh risk state concurrently
-    signals, _ = await asyncio.gather(
-        asyncio.to_thread(parse_message, message.content),
-        asyncio.to_thread(_update_risk_state),
-    )
+    # Parse immediately — don't wait for risk state refresh (use cached values)
+    signals = await asyncio.to_thread(parse_message, message.content)
     if not signals:
         logger.info("No valid signals parsed from message")
         return
@@ -120,6 +118,17 @@ async def _send_email_background(content: str) -> None:
 
 async def handle_buy(signal: Signal) -> None:
     """Process a BUY signal: calculate position size via risk manager, place market order."""
+    # If no expiry was parsed, default to nearest Friday (weekly expiry)
+    if signal.expiry is None:
+        today = date.today()
+        days_until_friday = (4 - today.weekday()) % 7
+        if days_until_friday == 0 and today.weekday() == 4:
+            # It's Friday — use today
+            signal.expiry = today
+        else:
+            signal.expiry = today + timedelta(days=days_until_friday or 7)
+        logger.info("No expiry in signal — defaulting to nearest Friday: %s", signal.expiry)
+
     note = (signal.note or "").lower()
     is_lotto = "lotto" in note
     is_rollup = "roll" in note
