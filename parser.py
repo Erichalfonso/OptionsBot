@@ -76,6 +76,10 @@ _SELL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Loose patterns to detect signals the strict patterns miss
+_LOOSE_BUY = re.compile(r"BOUGHT", re.IGNORECASE)
+_LOOSE_SELL = re.compile(r"SOLD", re.IGNORECASE)
+
 
 def _parse_expiry(expiry_str: str) -> date:
     """Parse M/DD expiry string and append current year.
@@ -222,7 +226,10 @@ def parse_message(content: str) -> list[Signal]:
 
         if signal is not None:
             signals.append(signal)
-            logger.debug("Parsed signal: %s", signal)
+            logger.info("Parsed signal: %s %s %.1f%s @ %.2f", signal.action, signal.ticker, signal.strike, signal.option_type[0], signal.price)
+        elif _LOOSE_BUY.search(line) or _LOOSE_SELL.search(line):
+            # Line looks like a signal but didn't match — this is a MISSED signal
+            logger.warning("MISSED SIGNAL — line contains BOUGHT/SOLD but failed to parse: %r", line)
         elif line:
             logger.debug("Skipped non-signal line: %r", line)
 

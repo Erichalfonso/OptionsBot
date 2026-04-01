@@ -7,7 +7,8 @@ Risk management enforced on every trade per Optionsful guidelines.
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timedelta, timezone
 
 import discord
 
@@ -53,9 +54,21 @@ def _update_risk_state() -> None:
 
 
 @client.event
+async def on_disconnect() -> None:
+    """Log when the bot loses connection to Discord."""
+    logger.warning("Discord connection LOST — waiting for auto-reconnect")
+
+
+@client.event
+async def on_resumed() -> None:
+    """Log when the bot resumes a dropped session."""
+    logger.info("Discord session RESUMED")
+
+
+@client.event
 async def on_ready() -> None:
     """Called when the bot has connected to Discord."""
-    logger.info("Bot connected as %s", client.user)
+    logger.info("Bot connected as %s (latency: %.0fms)", client.user, client.latency * 1000)
     logger.info("Listening on channel %d for author '%s'", config.CHANNEL_ID, config.SIGNAL_AUTHOR)
     logger.info(
         "Risk params: trade=%.0f-%.0f%% of account, exposure cap=%.0f%% (hard %.0f%%)",
@@ -68,9 +81,21 @@ async def on_ready() -> None:
         _update_risk_state()
         status = risk.get_status()
         logger.info("Risk status: %s", status)
+        # Keep risk state warm — refresh every 60s so signals never wait for it
+        asyncio.create_task(_risk_state_keepalive())
     except Exception as exc:
         logger.error("Failed to connect to Alpaca: %s", exc)
         logger.warning("Bot will continue but trades will fail until Alpaca is configured")
+
+
+async def _risk_state_keepalive() -> None:
+    """Periodically refresh risk state so it's always warm when a signal arrives."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.to_thread(_update_risk_state)
+        except Exception as exc:
+            logger.error("Risk keepalive failed: %s", exc)
 
 
 @client.event
@@ -84,19 +109,31 @@ async def on_message(message: discord.Message) -> None:
     if message.author.name != config.SIGNAL_AUTHOR:
         return
 
-    logger.info("Signal received:\n%s", message.content)
+    t_start = time.perf_counter()
+
+    # Measure Discord delivery latency
+    now_utc = datetime.now(timezone.utc)
+    discord_lag = (now_utc - message.created_at).total_seconds()
+    logger.info(
+        "Signal received (Discord lag: %.2fs):\n%s",
+        discord_lag, message.content,
+    )
 
     # Fire-and-forget: email and risk refresh run in background, never block trading
     asyncio.create_task(_send_email_background(message.content))
     asyncio.create_task(asyncio.to_thread(_update_risk_state))
 
-    # Parse immediately — don't wait for risk state refresh (use cached values)
-    signals = await asyncio.to_thread(parse_message, message.content)
+    # Risk state is kept warm by _risk_state_keepalive — just parse
+    signals = parse_message(message.content)
     if not signals:
         logger.info("No valid signals parsed from message")
         return
 
-    logger.info("Parsed %d signal(s) — executing", len(signals))
+    t_ready = time.perf_counter()
+    logger.info(
+        "Parsed %d signal(s) in %.0fms — executing",
+        len(signals), (t_ready - t_start) * 1000,
+    )
 
     for signal in signals:
         try:
@@ -159,8 +196,9 @@ async def handle_buy(signal: Signal) -> None:
     )
 
     try:
+        t_order = time.perf_counter()
         order_result = await asyncio.to_thread(broker.buy_option, signal, quantity)
-        logger.info("Order placed: %s", order_result)
+        logger.info("Order placed in %.0fms: %s", (time.perf_counter() - t_order) * 1000, order_result)
     except Exception as exc:
         logger.error("Broker buy failed: %s", exc)
         tracker.record_trade(signal, quantity, status="FAILED")
@@ -214,8 +252,9 @@ async def handle_sell(signal: Signal) -> None:
     )
 
     try:
+        t_order = time.perf_counter()
         order_result = await asyncio.to_thread(broker.sell_option, signal, current_quantity=current_qty)
-        logger.info("Sell order placed: %s", order_result)
+        logger.info("Sell order placed in %.0fms: %s", (time.perf_counter() - t_order) * 1000, order_result)
     except Exception as exc:
         logger.error("Broker sell failed: %s", exc)
         tracker.record_trade(signal, sell_qty, status="FAILED")

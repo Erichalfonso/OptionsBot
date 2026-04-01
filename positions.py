@@ -12,13 +12,25 @@ from parser import Signal
 logger = setup_logger("optionsbot.positions")
 
 
+def _position_key(ticker: str, strike: float, option_type: str) -> str:
+    """Normalized key for position lookup: 'SPY|520.0|CALL'."""
+    return f"{ticker.upper()}|{strike:.2f}|{option_type.upper()}"
+
+
 class PositionTracker:
-    """Tracks trades and open positions using a SQLite database."""
+    """Tracks trades and open positions using a SQLite database.
+
+    Maintains an in-memory hashmap of open positions for O(1) lookups.
+    The DB is the source of truth; the map is rebuilt on startup.
+    """
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
+        # In-memory position map: key -> position dict
+        self._open_map: dict[str, dict] = {}
         self._init_db()
+        self._rebuild_map()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -46,6 +58,14 @@ class PositionTracker:
         """)
         conn.commit()
         logger.info("Database initialized at %s", self.db_path)
+
+    def _rebuild_map(self) -> None:
+        """Rebuild in-memory position map from the database."""
+        self._open_map.clear()
+        for pos in self.get_open_positions():
+            key = _position_key(pos["ticker"], pos["strike"], pos["option_type"])
+            self._open_map[key] = pos
+        logger.info("Position map rebuilt: %d open position(s)", len(self._open_map))
 
     def record_trade(
         self,
@@ -98,6 +118,21 @@ class PositionTracker:
             signal.price,
             status,
         )
+
+        # Keep in-memory map in sync
+        if signal.action == "BUY" and status in ("OPEN", "PARTIAL"):
+            key = _position_key(signal.ticker, signal.strike, signal.option_type)
+            self._open_map[key] = {
+                "id": trade_id,
+                "ticker": signal.ticker,
+                "strike": signal.strike,
+                "option_type": signal.option_type,
+                "expiry": signal.expiry.isoformat() if signal.expiry else None,
+                "price": signal.price,
+                "quantity": quantity,
+                "status": status,
+            }
+
         return trade_id  # type: ignore[return-value]
 
     def get_open_positions(self) -> list[dict]:
@@ -119,7 +154,9 @@ class PositionTracker:
     def get_position_for_signal(self, signal: Signal) -> Optional[dict]:
         """Find the open position matching a sell signal.
 
-        Matches on ticker, strike, and option_type.
+        Uses in-memory hashmap for O(1) lookup. Falls back to fuzzy match
+        on ticker + option_type if exact strike doesn't match (handles
+        float rounding edge cases).
 
         Args:
             signal: A SELL signal to match against open positions.
@@ -127,23 +164,60 @@ class PositionTracker:
         Returns:
             The matching position dict, or None.
         """
+        # Fast path: exact hashmap lookup
+        key = _position_key(signal.ticker, signal.strike, signal.option_type)
+        pos = self._open_map.get(key)
+        if pos:
+            return pos
+
+        # Fuzzy fallback: same ticker + option_type, closest strike within $1
+        best = None
+        best_diff = float("inf")
+        for k, p in self._open_map.items():
+            if p["ticker"] == signal.ticker and p["option_type"] == signal.option_type:
+                diff = abs(p["strike"] - signal.strike)
+                if diff < best_diff and diff <= 1.0:
+                    best = p
+                    best_diff = diff
+
+        if best:
+            logger.warning(
+                "Fuzzy match for SELL %s %.1f%s — matched open position at strike %.1f (diff=%.2f)",
+                signal.ticker, signal.strike, signal.option_type[0],
+                best["strike"], best_diff,
+            )
+            return best
+
+        # Last resort: check DB directly in case map is stale
         conn = self._get_conn()
         row = conn.execute(
             """
             SELECT * FROM trades
             WHERE action = 'BUY'
               AND ticker = ?
-              AND strike = ?
               AND option_type = ?
               AND status IN ('OPEN', 'PARTIAL')
-            ORDER BY timestamp ASC
+              AND ABS(strike - ?) <= 1.0
+            ORDER BY ABS(strike - ?) ASC
             LIMIT 1
             """,
-            (signal.ticker, signal.strike, signal.option_type),
+            (signal.ticker, signal.option_type, signal.strike, signal.strike),
         ).fetchone()
 
         if row:
-            return dict(row)
+            result = dict(row)
+            logger.warning(
+                "Position found in DB but missing from map — resyncing. strike=%.1f",
+                result["strike"],
+            )
+            self._rebuild_map()
+            return result
+
+        logger.warning(
+            "No position found for SELL %s %.1f%s — open positions: %s",
+            signal.ticker, signal.strike, signal.option_type[0],
+            list(self._open_map.keys()) or "NONE",
+        )
         return None
 
     def update_position_status(self, trade_id: int, status: str) -> None:
@@ -176,6 +250,12 @@ class PositionTracker:
         conn.commit()
         logger.debug("Updated trade #%d quantity to %d", trade_id, new_quantity)
 
+        # Update in-memory map
+        for pos in self._open_map.values():
+            if pos.get("id") == trade_id:
+                pos["quantity"] = new_quantity
+                break
+
     def close_position(self, trade_id: int) -> None:
         """Mark a position as fully closed.
 
@@ -183,6 +263,15 @@ class PositionTracker:
             trade_id: The trade row ID.
         """
         self.update_position_status(trade_id, "CLOSED")
+
+        # Remove from in-memory map
+        to_remove = None
+        for key, pos in self._open_map.items():
+            if pos.get("id") == trade_id:
+                to_remove = key
+                break
+        if to_remove:
+            del self._open_map[to_remove]
 
     def get_trade_history(self, limit: int = 50) -> list[dict]:
         """Return recent trade history.
