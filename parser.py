@@ -43,22 +43,12 @@ class Signal:
         return f"{self.ticker}{date_str}{opt_char}{strike_str}"
 
 
-# Pattern for BUY signals WITH expiry:
+# Pattern for BUY signals:
 # BOUGHT {TICKER} {EXPIRY} {STRIKE}{C/P} [@] {PRICE} [notes...]
 _BUY_PATTERN = re.compile(
     r"BOUGHT\s+"
     r"(?P<ticker>[A-Z]{1,5})\s+"
     r"(?P<expiry>\d{1,2}/\d{1,2})\s+"
-    r"(?P<strike>\d+(?:\.\d+)?)(?P<opt_type>[CP])\s+"
-    r"@?\s*(?P<price>\d+(?:\.\d+)?)"
-    r"(?:\s+(?P<note>.+))?",
-    re.IGNORECASE,
-)
-
-# Pattern for BUY signals WITHOUT expiry (e.g. "BOUGHT SPY 657P 2.29"):
-_BUY_NO_EXPIRY_PATTERN = re.compile(
-    r"BOUGHT\s+"
-    r"(?P<ticker>[A-Z]{1,5})\s+"
     r"(?P<strike>\d+(?:\.\d+)?)(?P<opt_type>[CP])\s+"
     r"@?\s*(?P<price>\d+(?:\.\d+)?)"
     r"(?:\s+(?P<note>.+))?",
@@ -114,54 +104,30 @@ def _parse_option_type(char: str) -> str:
 def parse_buy_line(line: str) -> Optional[Signal]:
     """Parse a single BUY signal line.
 
-    Supports formats with and without expiry, with or without '@' before price,
-    and with leading text/emojis before the keyword.
-
     Args:
         line: A line like "BOUGHT SPY 3/20 657P 2.29 lotto"
-              or "BOUGHT SPY 657P @ 2.29"
 
     Returns:
         Signal object or None if the line doesn't match.
     """
-    stripped = line.strip()
-
-    # Try with-expiry pattern first (more specific), then without-expiry
-    match = _BUY_PATTERN.search(stripped)
-    if match and match.group("expiry"):
-        try:
-            expiry = _parse_expiry(match.group("expiry"))
-            return Signal(
-                action="BUY",
-                ticker=match.group("ticker").upper(),
-                expiry=expiry,
-                strike=float(match.group("strike")),
-                option_type=_parse_option_type(match.group("opt_type")),
-                price=float(match.group("price")),
-                note=match.group("note").strip() if match.group("note") else None,
-                raw=stripped,
-            )
-        except (ValueError, AttributeError) as exc:
-            logger.warning("Failed to parse BUY (with expiry) line: %r — %s", line, exc)
-
-    # Fall back to no-expiry pattern
-    match = _BUY_NO_EXPIRY_PATTERN.search(stripped)
+    match = _BUY_PATTERN.search(line.strip())
     if not match:
         return None
 
     try:
+        expiry = _parse_expiry(match.group("expiry"))
         return Signal(
             action="BUY",
             ticker=match.group("ticker").upper(),
-            expiry=None,
+            expiry=expiry,
             strike=float(match.group("strike")),
             option_type=_parse_option_type(match.group("opt_type")),
             price=float(match.group("price")),
             note=match.group("note").strip() if match.group("note") else None,
-            raw=stripped,
+            raw=line.strip(),
         )
     except (ValueError, AttributeError) as exc:
-        logger.warning("Failed to parse BUY (no expiry) line: %r — %s", line, exc)
+        logger.warning("Failed to parse BUY line: %r — %s", line, exc)
         return None
 
 

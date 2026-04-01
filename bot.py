@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 import discord
 
@@ -155,17 +155,6 @@ async def _send_email_background(content: str) -> None:
 
 async def handle_buy(signal: Signal) -> None:
     """Process a BUY signal: calculate position size via risk manager, place market order."""
-    # If no expiry was parsed, default to nearest Friday (weekly expiry)
-    if signal.expiry is None:
-        today = date.today()
-        days_until_friday = (4 - today.weekday()) % 7
-        if days_until_friday == 0 and today.weekday() == 4:
-            # It's Friday — use today
-            signal.expiry = today
-        else:
-            signal.expiry = today + timedelta(days=days_until_friday or 7)
-        logger.info("No expiry in signal — defaulting to nearest Friday: %s", signal.expiry)
-
     note = (signal.note or "").lower()
     is_lotto = "lotto" in note
     is_rollup = "roll" in note
