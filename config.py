@@ -33,9 +33,8 @@ MAX_TRADE_PCT: float = float(os.getenv("MAX_TRADE_PCT", "5.0"))    # max 5% per 
 MAX_EXPOSURE_PCT: float = float(os.getenv("MAX_EXPOSURE_PCT", "8.0"))        # soft target
 HARD_CAP_EXPOSURE_PCT: float = float(os.getenv("HARD_CAP_EXPOSURE_PCT", "10.0"))  # absolute max
 
-# Email notifications (Gmail)
-EMAIL_ADDRESS: str = os.getenv("EMAIL_ADDRESS", "")
-EMAIL_APP_PASSWORD: str = os.getenv("EMAIL_APP_PASSWORD", "")
+# Discord DM notifications — set to your Discord user ID to receive signal DMs
+NOTIFY_USER_ID: int = int(os.getenv("NOTIFY_USER_ID", "488501122135359499"))
 
 # Database — use Railway volume mount if available, else local
 _db_dir = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", str(Path(__file__).parent))

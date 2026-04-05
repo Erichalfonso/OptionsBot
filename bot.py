@@ -15,7 +15,7 @@ import discord
 import config
 from broker import AlpacaBroker
 from logger_setup import setup_logger
-from notifier import send_signal_email
+from notifier import send_discord_dm
 from parser import Signal, parse_message, parse_sell_size
 from positions import PositionTracker
 from risk_manager import RiskManager
@@ -119,8 +119,8 @@ async def on_message(message: discord.Message) -> None:
         discord_lag, message.content,
     )
 
-    # Fire-and-forget: email and risk refresh run in background, never block trading
-    asyncio.create_task(_send_email_background(message.content))
+    # Fire-and-forget: DM notification and risk refresh run in background, never block trading
+    asyncio.create_task(_send_dm_background(message.content))
     asyncio.create_task(asyncio.to_thread(_update_risk_state))
 
     # Risk state is kept warm by _risk_state_keepalive — just parse
@@ -145,12 +145,12 @@ async def on_message(message: discord.Message) -> None:
             logger.error("Error processing %s %s: %s", signal.action, signal.ticker, exc, exc_info=True)
 
 
-async def _send_email_background(content: str) -> None:
-    """Send email notification in background — never blocks trading."""
+async def _send_dm_background(content: str) -> None:
+    """Send Discord DM notification in background — never blocks trading."""
     try:
-        await asyncio.to_thread(send_signal_email, content)
+        await send_discord_dm(client, content)
     except Exception as exc:
-        logger.error("Background email failed: %s", exc)
+        logger.error("Background DM failed: %s", exc)
 
 
 async def handle_buy(signal: Signal) -> None:
