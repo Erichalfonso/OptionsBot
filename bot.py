@@ -211,27 +211,61 @@ def _get_last_closed_profit(ticker: str) -> float:
         return 0.0
 
 
-async def handle_sell(signal: Signal) -> None:
-    """Process a SELL signal: find position, place market order, update records."""
-    position = tracker.get_position_for_signal(signal)
-    if position is None:
-        logger.warning(
-            "No open position for SELL %s %.0f%s — skipping",
-            signal.ticker, signal.strike,
-            "C" if signal.option_type == "CALL" else "P",
-        )
-        return
+def _find_alpaca_position(signal: Signal) -> tuple[date | None, int | None]:
+    """Find a matching position on Alpaca by ticker, strike, and option type.
 
-    current_qty = position["quantity"]
+    Returns (expiry, quantity) or (None, None) if no match.
+    """
+    try:
+        for pos in broker.get_positions():
+            sym = pos["symbol"]  # e.g. "SPY260408C00660000"
+            if not sym.startswith(signal.ticker):
+                continue
+            suffix = sym[len(signal.ticker):]
+            if len(suffix) < 15:
+                continue
+            opt_char = suffix[6]
+            expected_char = "C" if signal.option_type == "CALL" else "P"
+            if opt_char != expected_char:
+                continue
+            try:
+                occ_strike = int(suffix[7:]) / 1000.0
+            except ValueError:
+                continue
+            if abs(occ_strike - signal.strike) > 0.01:
+                continue
+            expiry = date(2000 + int(suffix[:2]), int(suffix[2:4]), int(suffix[4:6]))
+            qty = int(pos["qty"])
+            logger.info("Alpaca position: %s -> expiry=%s, qty=%d", sym, expiry, qty)
+            return expiry, qty
+    except Exception as exc:
+        logger.error("Failed to query Alpaca positions: %s", exc)
+    return None, None
+
+
+async def handle_sell(signal: Signal) -> None:
+    """Process a SELL signal: resolve position from Alpaca, place market order."""
+    # Alpaca is the source of truth — get expiry and quantity from what we actually hold
+    if signal.expiry is None:
+        alpaca_expiry, alpaca_qty = await asyncio.to_thread(_find_alpaca_position, signal)
+        if alpaca_expiry is None:
+            logger.error(
+                "No Alpaca position for SELL %s %.0f%s — nothing to sell",
+                signal.ticker, signal.strike, signal.option_type[0],
+            )
+            return
+        signal.expiry = alpaca_expiry
+        current_qty = alpaca_qty
+    else:
+        # Expiry already set (unusual for sells, but handle it)
+        _, alpaca_qty = await asyncio.to_thread(_find_alpaca_position, signal)
+        current_qty = alpaca_qty or 1
+
     sell_fraction = parse_sell_size(signal.size) if signal.size else 1.0
     if sell_fraction is None:
         sell_fraction = 1.0
 
     sell_qty = broker._calculate_sell_quantity(current_qty, sell_fraction)
-
-    # SELL signals don't include expiry — get it from the open position
-    if signal.expiry is None and position.get("expiry"):
-        signal.expiry = date.fromisoformat(position["expiry"])
 
     logger.info(
         "SELL %s %.0f%s @ $%.2f — %s (%d of %d contracts)",
@@ -251,16 +285,19 @@ async def handle_sell(signal: Signal) -> None:
 
     tracker.record_trade(signal, sell_qty, status="CLOSED")
 
-    remaining = current_qty - sell_qty
-    if remaining <= 0:
-        tracker.close_position(position["id"])
-        pnl = tracker.calculate_pnl(signal.ticker, signal.strike, signal.option_type)
-        if pnl is not None:
-            logger.info("Position closed — realized P&L: $%.2f", pnl)
-    else:
-        tracker.update_position_quantity(position["id"], remaining)
-        tracker.update_position_status(position["id"], "PARTIAL")
-        logger.info("Partial sell — %d contracts remaining", remaining)
+    # Update DB position if we have one
+    position = tracker.get_position_for_signal(signal)
+    if position is not None:
+        remaining = current_qty - sell_qty
+        if remaining <= 0:
+            tracker.close_position(position["id"])
+            pnl = tracker.calculate_pnl(signal.ticker, signal.strike, signal.option_type)
+            if pnl is not None:
+                logger.info("Position closed — realized P&L: $%.2f", pnl)
+        else:
+            tracker.update_position_quantity(position["id"], remaining)
+            tracker.update_position_status(position["id"], "PARTIAL")
+            logger.info("Partial sell — %d contracts remaining", remaining)
 
     # Update risk state after sell — fire-and-forget
     asyncio.create_task(asyncio.to_thread(_update_risk_state))
