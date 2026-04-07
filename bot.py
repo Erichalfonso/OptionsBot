@@ -42,10 +42,10 @@ def _update_risk_state() -> None:
         buying_power = float(account["buying_power"])
         risk.update_account(equity, buying_power)
 
-        # Calculate current exposure from open positions
-        open_positions = tracker.get_open_positions()
+        # Calculate exposure from Alpaca's actual positions (thread-safe, no SQLite)
+        positions = broker.get_positions()
         total_exposure = sum(
-            pos["price"] * pos["quantity"] * 100 for pos in open_positions
+            float(pos["current_price"]) * int(pos["qty"]) * 100 for pos in positions
         )
         risk.update_exposure(total_exposure)
 
