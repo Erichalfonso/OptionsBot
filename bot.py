@@ -33,6 +33,15 @@ broker = AlpacaBroker()
 tracker = PositionTracker(config.DB_PATH)
 risk = RiskManager()
 
+# Track which signals succeeded per message ID so edits don't double-trade.
+# Key: Discord message ID → set of signal keys like "BUY|SPY|677.0|CALL"
+_message_successes: dict[int, set[str]] = {}
+
+
+def _signal_key(signal: Signal) -> str:
+    """Hashable key for dedup: action|ticker|strike|option_type."""
+    return f"{signal.action}|{signal.ticker}|{signal.strike}|{signal.option_type}"
+
 
 def _update_risk_state() -> None:
     """Refresh risk manager with current account and position data."""
@@ -135,14 +144,65 @@ async def on_message(message: discord.Message) -> None:
         len(signals), (t_ready - t_start) * 1000,
     )
 
+    successes = _message_successes.setdefault(message.id, set())
+
     for signal in signals:
         try:
+            ok = False
             if signal.action == "BUY":
-                await handle_buy(signal)
+                ok = await handle_buy(signal)
             elif signal.action == "SELL":
-                await handle_sell(signal)
+                ok = await handle_sell(signal)
+            if ok:
+                successes.add(_signal_key(signal))
         except Exception as exc:
             logger.error("Error processing %s %s: %s", signal.action, signal.ticker, exc, exc_info=True)
+
+
+@client.event
+async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+    """Reprocess edited messages — only execute signals that failed or were missed."""
+    if after.author == client.user:
+        return
+    if after.channel.id != config.CHANNEL_ID:
+        return
+    if after.author.name != config.SIGNAL_AUTHOR:
+        return
+
+    # Parse the edited content
+    signals = parse_message(after.content)
+    if not signals:
+        return
+
+    # Filter out signals that already succeeded from the original message
+    prior = _message_successes.get(after.id, set())
+    new_signals = [s for s in signals if _signal_key(s) not in prior]
+
+    if not new_signals:
+        logger.debug("Edit on message %d — all signals already succeeded, skipping", after.id)
+        return
+
+    logger.info(
+        "Message EDITED (id=%d) — %d new/fixed signal(s) to execute:\n%s",
+        after.id, len(new_signals), after.content,
+    )
+
+    asyncio.create_task(_send_dm_background(f"[EDITED] {after.content}"))
+    asyncio.create_task(asyncio.to_thread(_update_risk_state))
+
+    successes = _message_successes.setdefault(after.id, set())
+
+    for signal in new_signals:
+        try:
+            ok = False
+            if signal.action == "BUY":
+                ok = await handle_buy(signal)
+            elif signal.action == "SELL":
+                ok = await handle_sell(signal)
+            if ok:
+                successes.add(_signal_key(signal))
+        except Exception as exc:
+            logger.error("Error processing edited %s %s: %s", signal.action, signal.ticker, exc, exc_info=True)
 
 
 async def _send_dm_background(content: str) -> None:
@@ -153,8 +213,11 @@ async def _send_dm_background(content: str) -> None:
         logger.error("Background DM failed: %s", exc)
 
 
-async def handle_buy(signal: Signal) -> None:
-    """Process a BUY signal: calculate position size via risk manager, place market order."""
+async def handle_buy(signal: Signal) -> bool:
+    """Process a BUY signal: calculate position size via risk manager, place market order.
+
+    Returns True if the order was successfully submitted.
+    """
     note = (signal.note or "").lower()
     is_lotto = "lotto" in note
     is_rollup = "roll" in note
@@ -174,7 +237,7 @@ async def handle_buy(signal: Signal) -> None:
 
     if quantity == 0:
         logger.info("Risk manager says SKIP — %s %s", signal.ticker, signal.note or "")
-        return
+        return False
 
     logger.info(
         "BUY %s %s %.0f%s @ $%.2f qty=%d (risk-sized)%s",
@@ -191,12 +254,13 @@ async def handle_buy(signal: Signal) -> None:
     except Exception as exc:
         logger.error("Broker buy failed: %s", exc)
         tracker.record_trade(signal, quantity, status="FAILED")
-        return
+        return False
 
     tracker.record_trade(signal, quantity, status="OPEN")
 
     # Update exposure after trade — fire-and-forget, don't block next signal
     asyncio.create_task(asyncio.to_thread(_update_risk_state))
+    return True
 
 
 def _get_last_closed_profit(ticker: str) -> float:
@@ -243,8 +307,11 @@ def _find_alpaca_position(signal: Signal) -> tuple[date | None, int | None]:
     return None, None
 
 
-async def handle_sell(signal: Signal) -> None:
-    """Process a SELL signal: resolve position from Alpaca, place market order."""
+async def handle_sell(signal: Signal) -> bool:
+    """Process a SELL signal: resolve position from Alpaca, place market order.
+
+    Returns True if the order was successfully submitted.
+    """
     # Alpaca is the source of truth — get expiry and quantity from what we actually hold
     if signal.expiry is None:
         alpaca_expiry, alpaca_qty = await asyncio.to_thread(_find_alpaca_position, signal)
@@ -253,7 +320,7 @@ async def handle_sell(signal: Signal) -> None:
                 "No Alpaca position for SELL %s %.0f%s — nothing to sell",
                 signal.ticker, signal.strike, signal.option_type[0],
             )
-            return
+            return False
         signal.expiry = alpaca_expiry
         current_qty = alpaca_qty
     else:
@@ -281,7 +348,7 @@ async def handle_sell(signal: Signal) -> None:
     except Exception as exc:
         logger.error("Broker sell failed: %s", exc)
         tracker.record_trade(signal, sell_qty, status="FAILED")
-        return
+        return False
 
     tracker.record_trade(signal, sell_qty, status="CLOSED")
 
@@ -301,6 +368,7 @@ async def handle_sell(signal: Signal) -> None:
 
     # Update risk state after sell — fire-and-forget
     asyncio.create_task(asyncio.to_thread(_update_risk_state))
+    return True
 
 
 def main() -> None:
